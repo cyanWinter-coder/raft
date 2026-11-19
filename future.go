@@ -4,6 +4,7 @@
 package raft
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"sync"
@@ -184,9 +185,141 @@ func (s *shutdownFuture) Error() error {
 type userSnapshotFuture struct {
 	deferError
 
+	// ctx is the caller's context. A nil context is treated as one that is
+	// never canceled, which keeps the behavior of Snapshot() (as opposed to
+	// SnapshotWithContext()) unchanged.
+	ctx context.Context
+
 	// opener is a function used to open the snapshot. This is filled in
 	// once the future returns with no error.
 	opener func() (*SnapshotMeta, io.ReadCloser, error)
+
+	// mu guards state and cancel. The arbitration between a completed
+	// snapshot and a canceled context happens entirely under this lock, so
+	// exactly one outcome can ever be reported.
+	mu     sync.Mutex
+	state  userSnapshotState
+	cancel chan struct{}
+}
+
+// userSnapshotState tracks the lifecycle of a user-triggered snapshot.
+type userSnapshotState int
+
+const (
+	// userSnapshotPending means the snapshot is still in flight and no
+	// outcome has been decided.
+	userSnapshotPending userSnapshotState = iota
+	// userSnapshotCommitted means the snapshot finished successfully before
+	// the context was canceled and may be published.
+	userSnapshotCommitted
+	// userSnapshotCanceled means the context was canceled before the
+	// snapshot completed; any in-flight work must be discarded.
+	userSnapshotCanceled
+)
+
+// initWithContext sets up the cancellation signal used by the snapshot
+// goroutine. It must be called once before the future is dispatched. The
+// context drives cancellation on its own, through context.AfterFunc, so the
+// snapshot sink is notified even while the snapshot goroutine is blocked
+// inside Persist and cannot poll the context.
+func (u *userSnapshotFuture) initWithContext(ctx context.Context) {
+	u.init()
+	u.ctx = ctx
+	u.cancel = make(chan struct{})
+	context.AfterFunc(ctx, func() { _ = u.markCanceled() })
+}
+
+// done returns a channel that is closed once the context is canceled. It
+// returns nil when there is no context, and a nil channel never fires in a
+// select, so the automatic/non-cancelable path is unaffected.
+func (u *userSnapshotFuture) done() <-chan struct{} {
+	if u.ctx == nil {
+		return nil
+	}
+	return u.ctx.Done()
+}
+
+// markCanceled records that the caller has given up. It returns true if the
+// snapshot is now canceled and its work must be discarded, and false if the
+// snapshot had already been committed and the cancellation is too late.
+func (u *userSnapshotFuture) markCanceled() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.state != userSnapshotPending {
+		return false
+	}
+	u.state = userSnapshotCanceled
+	close(u.cancel)
+	return true
+}
+
+// canceled reports whether the snapshot has been canceled.
+func (u *userSnapshotFuture) canceled() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.state == userSnapshotCanceled
+}
+
+// cancelCh returns a channel that is closed when the snapshot is canceled.
+// Unlike done(), it is never nil so it can be handed to snapshot sinks.
+func (u *userSnapshotFuture) cancelCh() <-chan struct{} {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.cancel
+}
+
+// tryCommit records that the snapshot has finished successfully. It returns
+// true only when success wins the race against cancellation and the snapshot
+// may be published, and false when cancellation won and it must be discarded.
+//
+// Arbitration is a simple state transition under the mutex: cancellation is
+// driven only by markCanceled, which is installed via context.AfterFunc and
+// guaranteed by the context package to run once the context is canceled. The
+// commit path and the cancellation path therefore serialize on the same
+// mutex, and whichever reaches it first from a pending state wins. No context
+// channel is polluted into this decision, so there is no check-then-act gap.
+func (u *userSnapshotFuture) tryCommit() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.state != userSnapshotPending {
+		return u.state == userSnapshotCommitted
+	}
+	u.state = userSnapshotCommitted
+	return true
+}
+
+// Error blocks until the snapshot completes or, when a context was supplied,
+// until that context is canceled. On cancellation it returns the context's
+// error promptly without waiting for the in-flight snapshot work to finish;
+// that work is discarded asynchronously and never published. Subsequent calls
+// keep returning the same error.
+func (u *userSnapshotFuture) Error() error {
+	if u.err != nil {
+		return u.err
+	}
+	if u.errCh == nil {
+		panic("waiting for response on nil channel")
+	}
+
+	// Read the arbitrated state before blocking. A snapshot already committed
+	// must keep resolving to success even if the context is canceled in the
+	// gap between commitment and respond(); in that case we wait for the
+	// response rather than surfacing the late context error.
+	u.mu.Lock()
+	committed := u.state == userSnapshotCommitted
+	u.mu.Unlock()
+
+	select {
+	case u.err = <-u.errCh:
+		return u.err
+	case <-u.done():
+		if committed {
+			u.err = <-u.errCh
+			return u.err
+		}
+		u.err = u.ctx.Err()
+		return u.err
+	}
 }
 
 // Open is a function you can call to access the underlying snapshot and its

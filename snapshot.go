@@ -4,9 +4,11 @@
 package raft
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	metrics "github.com/hashicorp/go-metrics"
@@ -67,6 +69,137 @@ type SnapshotSink interface {
 	Cancel() error
 }
 
+// cancellableSnapshotSink wraps a SnapshotSink so a cancelable snapshot
+// can interrupt an FSM blocked in Persist and so that Close and Cancel are
+// each applied to the underlying sink at most once, no matter how the FSM's
+// Persist and Raft's own cleanup interleave. A nil future means the snapshot
+// can not be canceled; the wrapper then behaves as a pass-through.
+type cancellableSnapshotSink struct {
+	inner    SnapshotSink
+	ctx      context.Context
+	cancelCh <-chan struct{}
+	// future, when set, is the authoritative arbitration point. Close
+	// atomically claims the committed state on its mutex, so a snapshot can
+	// never be published once the context has won the race.
+	future *userSnapshotFuture
+
+	mu sync.Mutex
+	// finalized records the terminal action already applied to the
+	// underlying sink ("close", "cancel", or "") so it never happens twice.
+	finalized string
+	// closeResult is the outcome of the first Close, returned again to any
+	// later caller. In particular a Close that loses the cancellation race
+	// keeps returning context.Canceled instead of being masked as success,
+	// which matters because both the FSM's Persist and Raft may call Close.
+	closeResult error
+	// inFlight tracks writes handed to the underlying sink so Close and
+	// Cancel never touch the sink while a write is still running, which
+	// would race the sink's internal buffers and file handles.
+	inFlight sync.WaitGroup
+}
+
+// newCancellableSnapshotSink wraps sink. ctx is the authoritative
+// cancellation signal and cancelCh a second trigger so a blocked write is
+// woken even if the context.AfterFunc callback is scheduled slightly late.
+// future arbitrates publication and is nil for non-cancelable snapshots.
+func newCancellableSnapshotSink(sink SnapshotSink, ctx context.Context, cancelCh <-chan struct{}, future *userSnapshotFuture) *cancellableSnapshotSink {
+	return &cancellableSnapshotSink{inner: sink, ctx: ctx, cancelCh: cancelCh, future: future}
+}
+
+// Write forwards p to the underlying sink, racing the write against
+// cancellation. When the context is canceled while a write to slow storage is
+// in flight, Write returns the context error promptly; the underlying write
+// is allowed to finish in the background and is drained before Close or
+// Cancel touches the sink, so the sink is never used concurrently.
+func (s *cancellableSnapshotSink) Write(p []byte) (int, error) {
+	if s.ctx == nil {
+		return s.inner.Write(p)
+	}
+
+	// Take ownership of the bytes: the caller may reuse the buffer after
+	// Write returns on cancellation, while the background write still needs
+	// them.
+	buf := make([]byte, len(p))
+	copy(buf, p)
+
+	type writeResult struct {
+		n   int
+		err error
+	}
+	resultCh := make(chan writeResult, 1)
+	s.inFlight.Add(1)
+	go func() {
+		defer s.inFlight.Done()
+		n, err := s.inner.Write(buf)
+		resultCh <- writeResult{n, err}
+	}()
+
+	select {
+	case res := <-resultCh:
+		return res.n, res.err
+	case <-s.ctx.Done():
+		return 0, s.ctx.Err()
+	case <-s.cancelCh:
+		return 0, context.Canceled
+	}
+}
+
+// ID returns the ID of the underlying sink.
+func (s *cancellableSnapshotSink) ID() string {
+	return s.inner.ID()
+}
+
+// Close finalizes the underlying sink, publishing the snapshot, but only if
+// cancellation has not already won. The publication decision is made by
+// tryCommit under the future's mutex, where it is atomic with the state
+// transition to either committed or canceled; there is no check-then-act
+// window. It fails with context.Canceled when the context won, leaving the
+// caller to invoke Cancel. A non-cancelable snapshot (nil future) always
+// commits. Repeated calls return the original outcome rather than masking a
+// lost race as success.
+func (s *cancellableSnapshotSink) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.finalized == "close" {
+		return s.closeResult
+	}
+	if s.finalized == "cancel" {
+		// Already discarded; report cancellation to any later Close.
+		return context.Canceled
+	}
+	if s.future != nil && !s.future.tryCommit() {
+		s.closeResult = context.Canceled
+		return s.closeResult
+	}
+	s.finalized = "close"
+	s.inFlight.Wait()
+	s.closeResult = s.inner.Close()
+	return s.closeResult
+}
+
+// Cancel discards the underlying sink exactly once, after any in-flight
+// writes have drained. It first claims the canceled outcome on the future,
+// matching what context cancellation does, so a later Close can never
+// publish the snapshot (tryCommit will then fail). It is safe to call after
+// the FSM's Persist has already called Close or Cancel; when Close already
+// won the committed outcome, Cancel is a no-op.
+func (s *cancellableSnapshotSink) Cancel() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.finalized != "" {
+		return nil
+	}
+	// Claim the canceled outcome. If success was already committed this
+	// returns false, but in that case Close would have set finalized first,
+	// so reaching here means cancellation legitimately wins.
+	if s.future != nil {
+		s.future.markCanceled()
+	}
+	s.finalized = "cancel"
+	s.inFlight.Wait()
+	return s.inner.Cancel()
+}
+
 // runSnapshots is a long running goroutine used to manage taking
 // new snapshots of the FSM. It runs in parallel to the FSM and
 // main goroutines, so that snapshots do not block normal operation.
@@ -79,26 +212,45 @@ func (r *Raft) runSnapshots() {
 				continue
 			}
 
-			// Trigger a snapshot
-			if _, err := r.takeSnapshot(); err != nil && !errors.Is(err, ErrNothingNewToSnapshot) {
+			// Trigger a snapshot. Automatic snapshots are not cancelable,
+			// so their behavior is unchanged.
+			if _, err := r.takeSnapshot(context.Background(), nil); err != nil && !errors.Is(err, ErrNothingNewToSnapshot) {
 				r.logger.Error("failed to take snapshot", "error", err)
 			}
 
 		case future := <-r.userSnapshotCh:
 			// User-triggered, run immediately
-			id, err := r.takeSnapshot()
-			if err != nil && !errors.Is(err, ErrNothingNewToSnapshot) {
-				r.logger.Error("failed to take snapshot", "error", err)
-			} else if err == nil {
-				future.opener = func() (*SnapshotMeta, io.ReadCloser, error) {
-					return r.snapshots.Open(id)
-				}
-			}
-			future.respond(err)
+			id, err := r.takeSnapshot(future.ctx, future)
+			r.finishUserSnapshot(future, id, err)
 
 		case <-r.shutdownCh:
 			return
 		}
+	}
+}
+
+// finishUserSnapshot resolves a user-triggered snapshot future. It applies
+// the same arbitration as the snapshot work itself: a canceled snapshot is
+// reported with the context error even if the work unwound with a different
+// error, and a snapshot that completed before cancellation is reported as a
+// success. The future's own state machine makes sure exactly one outcome is
+// ever reported, regardless of how completion and cancellation interleave.
+func (r *Raft) finishUserSnapshot(future *userSnapshotFuture, id string, takeErr error) {
+	switch {
+	case future.canceled():
+		// Cancellation won. takeSnapshot is responsible for having discarded
+		// any resources the snapshot store created.
+		future.respond(future.ctx.Err())
+	case takeErr != nil:
+		if !errors.Is(takeErr, ErrNothingNewToSnapshot) {
+			r.logger.Error("failed to take snapshot", "error", takeErr)
+		}
+		future.respond(takeErr)
+	default:
+		future.opener = func() (*SnapshotMeta, io.ReadCloser, error) {
+			return r.snapshots.Open(id)
+		}
+		future.respond(nil)
 	}
 }
 
@@ -123,8 +275,57 @@ func (r *Raft) shouldSnapshot() bool {
 // takeSnapshot is used to take a new snapshot. This must only be called from
 // the snapshot thread, never the main thread. This returns the ID of the new
 // snapshot, along with an error.
-func (r *Raft) takeSnapshot() (string, error) {
+//
+// ctx allows the work to be abandoned when the caller gives up; a
+// context.Background() context (used by automatic snapshots) is never
+// canceled. userFuture is non-nil only for user-triggered snapshots and
+// arbitrates the race between a completed snapshot and a canceled context.
+//
+// On cancellation the in-flight snapshot is discarded: nothing is published
+// as the latest stable snapshot, no log compaction happens, and every
+// resource the snapshot store created is closed or deleted.
+func (r *Raft) takeSnapshot(ctx context.Context, userFuture *userSnapshotFuture) (string, error) {
 	defer metrics.MeasureSince([]string{"raft", "snapshot", "takeSnapshot"}, time.Now())
+
+	// observeCancel flips the user future to its canceled state the first
+	// time the context is observed done, closing the channel that unblocks
+	// the sink wrapper. It is a no-op for automatic snapshots (nil
+	// userFuture). It returns the context error for convenience.
+	observeCancel := func() error {
+		if userFuture != nil {
+			userFuture.markCanceled()
+		}
+		return ctx.Err()
+	}
+	// observeContext checks the context without blocking and flips the user
+	// future to canceled if it has expired since the last observation. This
+	// covers cancellation that lands between select points, such as while
+	// Persist is running. It reports whether the snapshot is now canceled.
+	observeContext := func() bool {
+		if userFuture == nil {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			userFuture.markCanceled()
+			return userFuture.canceled()
+		default:
+			return userFuture.canceled()
+		}
+	}
+	// await blocks until the future's response fires, the context is
+	// canceled, or Raft shuts down. It returns an error when the wait was
+	// interrupted.
+	await := func(respCh chan error) error {
+		select {
+		case <-respCh:
+			return nil
+		case <-ctx.Done():
+			return observeCancel()
+		case <-r.shutdownCh:
+			return ErrRaftShutdown
+		}
+	}
 
 	// Create a request for the FSM to perform a snapshot.
 	snapReq := &reqSnapshotFuture{}
@@ -135,16 +336,44 @@ func (r *Raft) takeSnapshot() (string, error) {
 	case r.fsmSnapshotCh <- snapReq:
 	case <-r.shutdownCh:
 		return "", ErrRaftShutdown
+	case <-ctx.Done():
+		return "", observeCancel()
 	}
 
-	// Wait until we get a response
-	if err := snapReq.Error(); err != nil {
-		if err != ErrNothingNewToSnapshot {
-			err = fmt.Errorf("failed to start snapshot: %v", err)
-		}
-		return "", err
+	// Wait until we get a response, unless the caller gives up first. The
+	// FSM goroutine owns snapReq until it responds, so on cancellation we
+	// can not read its result here; the waiting goroutine instead releases
+	// the FSMSnapshot once the response arrives.
+	responded := make(chan struct{})
+	var snapErr error
+	go func() {
+		snapErr = snapReq.Error()
+		close(responded)
+	}()
+	select {
+	case <-responded:
+	case <-r.shutdownCh:
+		return "", ErrRaftShutdown
+	case <-ctx.Done():
+		go func() {
+			<-responded
+			if snapErr == nil && snapReq.snapshot != nil {
+				snapReq.snapshot.Release()
+			}
+		}()
+		return "", observeCancel()
 	}
-	defer snapReq.snapshot.Release()
+	if snapErr != nil {
+		if snapErr != ErrNothingNewToSnapshot {
+			snapErr = fmt.Errorf("failed to start snapshot: %v", snapErr)
+		}
+		return "", snapErr
+	}
+	defer func() {
+		if snapReq.snapshot != nil {
+			snapReq.snapshot.Release()
+		}
+	}()
 
 	// Make a request for the configurations and extract the committed info.
 	// We have to use the future here to safely get this information since
@@ -156,6 +385,11 @@ func (r *Raft) takeSnapshot() (string, error) {
 	case r.configurationsCh <- configReq:
 	case <-r.shutdownCh:
 		return "", ErrRaftShutdown
+	case <-ctx.Done():
+		return "", observeCancel()
+	}
+	if err := await(configReq.errCh); err != nil {
+		return "", err
 	}
 	if err := configReq.Error(); err != nil {
 		return "", err
@@ -176,6 +410,11 @@ func (r *Raft) takeSnapshot() (string, error) {
 			committedIndex, snapReq.index)
 	}
 
+	// Check once more before creating any resources in the snapshot store.
+	if observeContext() {
+		return "", ctx.Err()
+	}
+
 	// Create a new snapshot.
 	r.logger.Info("starting snapshot up to", "index", snapReq.index)
 	start := time.Now()
@@ -186,23 +425,56 @@ func (r *Raft) takeSnapshot() (string, error) {
 	}
 	metrics.MeasureSince([]string{"raft", "snapshot", "create"}, start)
 
+	// Wrap the sink so that, for a cancelable snapshot, an FSM blocked in
+	// Persist is unblocked as soon as the context is canceled, and so that
+	// Close and Cancel can never both run against the underlying sink.
+	var (
+		wrapperCtx    context.Context
+		wrapperCancel <-chan struct{}
+	)
+	if userFuture != nil {
+		wrapperCtx = ctx
+		wrapperCancel = userFuture.cancelCh()
+	}
+	sink = newCancellableSnapshotSink(sink, wrapperCtx, wrapperCancel, userFuture)
+
 	// Try to persist the snapshot.
 	start = time.Now()
-	if err := snapReq.snapshot.Persist(sink); err != nil {
-		_ = sink.Cancel()
-		return "", fmt.Errorf("failed to persist snapshot: %v", err)
-	}
+	persistErr := snapReq.snapshot.Persist(sink)
 	metrics.MeasureSince([]string{"raft", "snapshot", "persist"}, start)
 
-	// Close and check for error.
+	// A persist error means the snapshot can not succeed; discard the sink.
+	if persistErr != nil {
+		if cancelErr := sink.Cancel(); cancelErr != nil {
+			r.logger.Error("failed to cancel snapshot after persist error", "error", cancelErr)
+		}
+		// Cancellation may have been the cause; report it when it won.
+		if userFuture != nil && observeContext() {
+			return "", ctx.Err()
+		}
+		return "", fmt.Errorf("failed to persist snapshot: %v", persistErr)
+	}
+
+	// Finalize the sink. The publication decision is arbitrated here through
+	// tryCommit, so a context that has won makes Close fail without the
+	// snapshot ever reaching the store; the sink is then discarded and the
+	// stable snapshot and log compaction are left untouched.
 	if err := sink.Close(); err != nil {
+		if userFuture != nil && errors.Is(err, context.Canceled) {
+			if cancelErr := sink.Cancel(); cancelErr != nil {
+				r.logger.Error("failed to cancel snapshot after context cancellation", "error", cancelErr)
+			}
+			return "", ctx.Err()
+		}
 		return "", fmt.Errorf("failed to close snapshot: %v", err)
 	}
 
-	// Update the last stable snapshot info.
+	// Update the last stable snapshot info. This only runs once the snapshot
+	// is fully committed, so a canceled snapshot never reaches it.
 	r.setLastSnapshot(snapReq.index, snapReq.term)
 
-	// Compact the logs.
+	// Compact the logs. This only runs once the snapshot is fully committed,
+	// so a canceled snapshot can never trigger log compaction.
 	if err := r.compactLogs(snapReq.index); err != nil {
 		return "", err
 	}

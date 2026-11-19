@@ -4,6 +4,7 @@
 package raft
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -1075,14 +1076,42 @@ func (r *Raft) Shutdown() Future {
 // Snapshot is used to manually force Raft to take a snapshot. Returns a future
 // that can be used to block until complete, and that contains a function that
 // can be used to open the snapshot.
+//
+// The snapshot can not be canceled: the returned future only resolves once
+// the snapshot finishes or Raft shuts down. For a cancelable snapshot use
+// SnapshotWithContext.
 func (r *Raft) Snapshot() SnapshotFuture {
+	return r.SnapshotWithContext(context.Background())
+}
+
+// SnapshotWithContext is used to manually force Raft to take a snapshot that
+// may be canceled by the caller. When ctx is canceled before the snapshot has
+// completed, the returned future reports ctx.Err() promptly, without waiting
+// for any snapshot IO still in progress. The in-flight snapshot is abandoned:
+// it is never published as the latest stable snapshot, no log compaction is
+// performed for it, and any resources created by the snapshot store are closed
+// or deleted once the in-progress work unwinds.
+//
+// If the context is canceled and the snapshot finalizes at the same time,
+// exactly one outcome is reported; success and cancellation are never both
+// observable on the same future. A snapshot that has already completed is not
+// affected by a later cancellation. Passing context.Background() is
+// equivalent to Snapshot().
+func (r *Raft) SnapshotWithContext(ctx context.Context) SnapshotFuture {
 	future := &userSnapshotFuture{}
-	future.init()
+	future.initWithContext(ctx)
 	select {
 	case r.userSnapshotCh <- future:
 		return future
 	case <-r.shutdownCh:
 		future.respond(ErrRaftShutdown)
+		return future
+	case <-ctx.Done():
+		// The snapshot goroutine never received the request, so there is no
+		// in-flight work to clean up. Mark it canceled so the state stays
+		// consistent and the future reports the context error.
+		future.markCanceled()
+		future.respond(ctx.Err())
 		return future
 	}
 }
