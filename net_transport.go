@@ -205,6 +205,14 @@ type netPipeline struct {
 	shutdown     bool
 	shutdownCh   chan struct{}
 	shutdownLock sync.Mutex
+
+	// writeLock serializes encoding onto the connection, so concurrent callers
+	// of AppendEntries cannot interleave frames on the stream.
+	writeLock sync.Mutex
+
+	// pending tracks every future the transport accepted but has not completed
+	// yet. Close completes each of them exactly once with ErrPipelineShutdown.
+	pending map[*appendFuture]struct{}
 }
 
 // NewNetworkTransportWithConfig creates a new network transport with the given config struct
@@ -828,9 +836,58 @@ func newNetPipeline(trans *NetworkTransport, conn *netConn, maxInFlight int) *ne
 		inprogressCh: make(chan *appendFuture, maxInFlight-2),
 		doneCh:       make(chan AppendFuture, maxInFlight-2),
 		shutdownCh:   make(chan struct{}),
+		pending:      make(map[*appendFuture]struct{}),
 	}
 	go n.decodeResponses()
 	return n
+}
+
+// trackFuture records a future as in flight so Close can complete it if the
+// connection goes away before its response arrives. It reports false if the
+// pipeline is already shutting down, in which case the caller must not send.
+// Callers must not hold shutdownLock.
+func (n *netPipeline) trackFuture(future *appendFuture) bool {
+	n.shutdownLock.Lock()
+	defer n.shutdownLock.Unlock()
+	if n.shutdown {
+		return false
+	}
+	n.pending[future] = struct{}{}
+	return true
+}
+
+// claimFuture removes a future from the pending set, transferring ownership of
+// its completion to the caller. It returns false when the future was already
+// completed by Close (or a previous claim), in which case the caller must not
+// touch its response buffer. Claiming before decoding guarantees that Close's
+// flush and the decoder can never both write the same future.
+func (n *netPipeline) claimFuture(future *appendFuture) bool {
+	n.shutdownLock.Lock()
+	defer n.shutdownLock.Unlock()
+	if _, ok := n.pending[future]; !ok {
+		return false
+	}
+	delete(n.pending, future)
+	return true
+}
+
+// deliverFuture forwards a completed future to the consumer channel. It gives
+// up once the pipeline shuts down; the future has already been completed, so a
+// caller waiting on it does not block, and Close has removed it from pending.
+func (n *netPipeline) deliverFuture(future *appendFuture) bool {
+	select {
+	case n.doneCh <- future:
+		return true
+	case <-n.shutdownCh:
+		return false
+	}
+}
+
+// isShutdown reports whether the pipeline has stopped.
+func (n *netPipeline) isShutdown() bool {
+	n.shutdownLock.Lock()
+	defer n.shutdownLock.Unlock()
+	return n.shutdown
 }
 
 // decodeResponses is a long running routine that decodes the responses
@@ -840,15 +897,34 @@ func (n *netPipeline) decodeResponses() {
 	for {
 		select {
 		case future := <-n.inprogressCh:
+			// Claim the future before decoding into its response buffer. If
+			// Close already completed it, stop touching it.
+			if !n.claimFuture(future) {
+				return
+			}
 			if timeout > 0 {
 				_ = n.conn.conn.SetReadDeadline(time.Now().Add(timeout))
 			}
 
 			_, err := decodeResponse(n.conn, future.resp)
+			if err != nil && n.isShutdown() {
+				// The read failed because Close released the connection.
+				// Report the same terminal error the in-memory transport and
+				// Close use, so callers see uniform close semantics.
+				err = ErrPipelineShutdown
+			}
 			future.respond(err)
-			select {
-			case n.doneCh <- future:
-			case <-n.shutdownCh:
+			// Hand the completed future to the consumer even when it failed so
+			// callers always observe the error. Delivery gives up as soon as
+			// the pipeline shuts down, so a consumer that is already gone
+			// cannot wedge the decoder.
+			n.deliverFuture(future)
+			if err != nil {
+				// A decode error means the response stream is out of sync and
+				// the connection cannot be reused. Shut the pipeline down so
+				// the replication layer reconnects with a fresh session; every
+				// other in-flight future completes exactly once with err.
+				n.flushAndClose(err)
 				return
 			}
 		case <-n.shutdownCh:
@@ -857,8 +933,51 @@ func (n *netPipeline) decodeResponses() {
 	}
 }
 
+// flushAndClose completes every still-pending future with err, publishes them
+// to the consumer channel best-effort, and then closes the pipeline. It is
+// safe to call from the decoder and from Close concurrently.
+//
+// Publishing before closing shutdownCh lets a consumer (the replication
+// session) observe the terminal responses and drain immediately instead of
+// waiting for the drain timeout. Delivery is non-blocking: a consumer that is
+// not reading must not wedge Close.
+func (n *netPipeline) flushAndClose(err error) {
+	n.shutdownLock.Lock()
+	if n.shutdown {
+		n.shutdownLock.Unlock()
+		return
+	}
+	n.shutdown = true
+	pending := n.pending
+	n.pending = make(map[*appendFuture]struct{})
+	n.shutdownLock.Unlock()
+
+	for future := range pending {
+		future.respond(err)
+	}
+	for future := range pending {
+		select {
+		case n.doneCh <- future:
+		default:
+		}
+	}
+
+	n.shutdownLock.Lock()
+	close(n.shutdownCh)
+	n.shutdownLock.Unlock()
+}
+
 // AppendEntries is used to pipeline a new append entries request.
 func (n *netPipeline) AppendEntries(args *AppendEntriesRequest, resp *AppendEntriesResponse) (AppendFuture, error) {
+	// Reject new requests once the pipeline is closed, before touching the
+	// connection (which may already be released).
+	n.shutdownLock.Lock()
+	shutdown := n.shutdown
+	n.shutdownLock.Unlock()
+	if shutdown {
+		return nil, ErrPipelineShutdown
+	}
+
 	// Create a new future
 	future := &appendFuture{
 		start: time.Now(),
@@ -867,13 +986,31 @@ func (n *netPipeline) AppendEntries(args *AppendEntriesRequest, resp *AppendEntr
 	}
 	future.init()
 
+	// Track the future before sending so Close cannot miss a request that was
+	// written but whose response never arrives. Tracking and the shutdown
+	// check happen under the same lock Close uses, so a request is either
+	// tracked before Close's flush (and completed by it) or refused here.
+	if !n.trackFuture(future) {
+		return nil, ErrPipelineShutdown
+	}
+
+	// Serialize writes to the connection. This mirrors the single-writer
+	// guarantee of the transport's decode routine and keeps a concurrent
+	// caller from interleaving frames on the stream.
+	n.writeLock.Lock()
 	// Add a send timeout
 	if timeout := n.trans.timeout; timeout > 0 {
 		_ = n.conn.conn.SetWriteDeadline(time.Now().Add(timeout))
 	}
-
-	// Send the RPC
-	if err := sendRPC(n.conn, rpcAppendEntries, future.args); err != nil {
+	err := sendRPC(n.conn, rpcAppendEntries, future.args)
+	n.writeLock.Unlock()
+	if err != nil {
+		// Claim then complete only if we still own the future: Close may have
+		// beaten us here and already responded it.
+		if n.claimFuture(future) {
+			future.respond(err)
+		}
+		n.flushAndClose(err)
 		return nil, err
 	}
 
@@ -883,6 +1020,12 @@ func (n *netPipeline) AppendEntries(args *AppendEntriesRequest, resp *AppendEntr
 	case n.inprogressCh <- future:
 		return future, nil
 	case <-n.shutdownCh:
+		// The pipeline shut down before the request was handed off. It has
+		// already been completed by flushAndClose, so the caller is not left
+		// waiting; fail this call so the replication layer reconnects.
+		if n.claimFuture(future) {
+			future.respond(ErrPipelineShutdown)
+		}
 		return nil, ErrPipelineShutdown
 	}
 }
@@ -894,16 +1037,16 @@ func (n *netPipeline) Consumer() <-chan AppendFuture {
 
 // Close is used to shut down the pipeline connection.
 func (n *netPipeline) Close() error {
-	n.shutdownLock.Lock()
-	defer n.shutdownLock.Unlock()
-	if n.shutdown {
+	if n.isShutdown() {
 		return nil
 	}
 
-	// Release the connection
+	// Mark the pipeline shut down and complete every in-flight future with
+	// ErrPipelineShutdown before releasing the connection. Releasing first
+	// would let the decoder observe a raw "use of closed network connection"
+	// error, which would leak an implementation detail instead of the uniform
+	// close error. The release then unblocks a decoder stuck in a read.
+	n.flushAndClose(ErrPipelineShutdown)
 	_ = n.conn.Release()
-
-	n.shutdown = true
-	close(n.shutdownCh)
 	return nil
 }

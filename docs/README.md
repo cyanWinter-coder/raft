@@ -104,4 +104,4 @@ responsible for handling many operations.
 * **askPeerForVote (candidate only)** - short lived goroutine that synchronously sends a RequestVote RPC to all voting peers, and waits for the response. One goroutine per voting peer.
 * **replicate (leader only)** - long running goroutine that synchronously sends log entry AppendEntry RPCs to all peers. Also starts the heartbeat thread, and possibly the pipelineDecode thread. Runs sendLatestSnapshot when AppendEntry fails.
    * **heartbeat (leader only)** - long running goroutine that synchronously sends heartbeat AppendEntry RPCs to all peers.
-   * **pipelineDecode (leader only)**
+   * **pipelineDecode (leader only)** - consumes responses for one pipelined AppendEntries connection session. All ordering and failure policy lives in `pipelineSession` (`pipeline.go`): a session has its own generation so late responses from an older connection cannot advance state, only contiguous successful batches move `nextIndex`/the commitment, and every in-flight batch is completed exactly once when the session fails or closes. The decoder itself only applies the session outcome.

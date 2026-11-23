@@ -93,6 +93,12 @@ type followerReplication struct {
 	// allowPipeline is used to determine when to pipeline the AppendEntries RPCs.
 	// It is private to this replication goroutine.
 	allowPipeline bool
+
+	// pipelineGen is incremented for every new pipeline connection session.
+	// Batches remember the generation they were sent under so a late response
+	// from an old, closed session can only complete its own waiter and can
+	// never update the state of the newer session.
+	pipelineGen uint64
 }
 
 // notifyAll is used to notify all the waiting verify futures
@@ -443,6 +449,12 @@ func (r *Raft) heartbeat(s *followerReplication, stopCh chan struct{}) {
 // and want to switch to a higher performance pipeline mode of replication.
 // We only pipeline AppendEntries commands, and if we ever hit an error, we fall
 // back to the standard replication which can handle more complex situations.
+//
+// Each invocation owns one connection session (a pipelineSession with a fresh
+// generation). Responses from an older session can no longer mutate the
+// replicated position, advancement only happens over contiguous successful
+// batches, and every in-flight batch is finalized exactly once when the
+// session ends.
 func (r *Raft) pipelineReplicate(s *followerReplication) error {
 	s.peerLock.RLock()
 	peer := s.peer
@@ -453,7 +465,12 @@ func (r *Raft) pipelineReplicate(s *followerReplication) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = pipeline.Close() }()
+
+	// Every connection session gets its own generation. Any response that
+	// arrives after this session ends carries an older generation and cannot
+	// update the next session's state.
+	gen := nextPipelineGen(&s.pipelineGen)
+	session := newPipelineSessionAt(gen, pipeline, replicatedFrontier(atomic.LoadUint64(&s.nextIndex)))
 
 	// Log start and stop of pipeline
 	r.logger.Info("pipelining replication", "peer", peer)
@@ -464,7 +481,7 @@ func (r *Raft) pipelineReplicate(s *followerReplication) error {
 	finishCh := make(chan struct{})
 
 	// Start a dedicated decoder
-	r.goFunc(func() { r.pipelineDecode(s, pipeline, stopCh, finishCh) })
+	r.goFunc(func() { r.pipelineDecode(s, session, stopCh, finishCh) })
 
 	// Start pipeline sends at the last good nextIndex
 	nextIndex := atomic.LoadUint64(&s.nextIndex)
@@ -478,12 +495,12 @@ SEND:
 		case maxIndex := <-s.stopCh:
 			// Make a best effort to replicate up to this index
 			if maxIndex > 0 {
-				r.pipelineSend(s, pipeline, &nextIndex, maxIndex)
+				r.pipelineSend(s, session, &nextIndex, maxIndex)
 			}
 			break SEND
 		case deferErr := <-s.triggerDeferErrorCh:
 			lastLogIdx, _ := r.getLastLog()
-			shouldStop = r.pipelineSend(s, pipeline, &nextIndex, lastLogIdx)
+			shouldStop = r.pipelineSend(s, session, &nextIndex, lastLogIdx)
 			if !shouldStop {
 				deferErr.respond(nil)
 			} else {
@@ -491,12 +508,22 @@ SEND:
 			}
 		case <-s.triggerCh:
 			lastLogIdx, _ := r.getLastLog()
-			shouldStop = r.pipelineSend(s, pipeline, &nextIndex, lastLogIdx)
+			shouldStop = r.pipelineSend(s, session, &nextIndex, lastLogIdx)
 		case <-randomTimeout(r.config().CommitTimeout):
 			lastLogIdx, _ := r.getLastLog()
-			shouldStop = r.pipelineSend(s, pipeline, &nextIndex, lastLogIdx)
+			shouldStop = r.pipelineSend(s, session, &nextIndex, lastLogIdx)
 		}
 	}
+
+	// Stop accepting new batches. Responses already in flight are still
+	// drained below so their waiters finish and so contiguous progress they
+	// carry is not lost.
+	session.stopAccepting()
+
+	// Drain responses that were already started. The timeout keeps a broken
+	// transport from wedging the replication goroutine; raft shutdown also
+	// interrupts the wait.
+	session.waitEmpty(r.shutdownCh, pipelineDrainTimeout)
 
 	// Stop our decoder, and wait for it to finish
 	close(stopCh)
@@ -504,25 +531,65 @@ SEND:
 	case <-finishCh:
 	case <-r.shutdownCh:
 	}
+
+	// Finalize anything the drain could not complete, each exactly once, and
+	// release the transport pipeline.
+	session.close(ErrPipelineShutdown)
+
+	// The decoder has finished, so it is safe to apply the session outcome to
+	// the replication-only state that standard replication also uses. Doing it
+	// here (rather than in the decoder) keeps failures/allowPipeline owned by
+	// this goroutine, as they were before pipelining existed.
+	outcome, set, lastLog, noRetry, termErr := session.terminalResult()
+	if !set {
+		// The session ended because we stopped sending (stopCh, trigger
+		// drained, or a clean close). Nothing to reconcile.
+		return nil
+	}
+
+	switch outcome {
+	case pipelineOutcomeRejected:
+		// Reconcile nextIndex with the follower's hint exactly like standard
+		// replication, then let it take over. The formula can only lower
+		// nextIndex, so it can never skip an unacknowledged gap.
+		atomic.StoreUint64(&s.nextIndex, max(min(atomic.LoadUint64(&s.nextIndex)-1, lastLog+1), 1))
+		if noRetry {
+			s.failures = 0
+		} else {
+			s.failures++
+		}
+		r.logger.Warn("pipelined replication fell back to standard mode",
+			"peer", peer, "next", atomic.LoadUint64(&s.nextIndex))
+	case pipelineOutcomeRPCError:
+		s.failures++
+		r.logger.Error("pipeline replication aborted by transport error",
+			"peer", peer, "error", termErr)
+	case pipelineOutcomeStaleTerm:
+		// handleStaleTerm already told the leader to step down.
+	}
 	return nil
 }
 
-// pipelineSend is used to send data over a pipeline. It is a helper to
-// pipelineReplicate.
-func (r *Raft) pipelineSend(s *followerReplication, p AppendPipeline, nextIdx *uint64, lastIndex uint64) (shouldStop bool) {
+// pipelineSend is used to send data over a pipeline session. It is a helper to
+// pipelineReplicate. A failed enlistment ends the session and signals that
+// standard replication must take over.
+func (r *Raft) pipelineSend(s *followerReplication, session *pipelineSession, nextIdx *uint64, lastIndex uint64) (shouldStop bool) {
 	// Create a new append request
 	req := new(AppendEntriesRequest)
 	if err := r.setupAppendEntries(s, req, *nextIdx, lastIndex); err != nil {
 		return true
 	}
 
-	// Pipeline the append entries
-	if _, err := p.AppendEntries(req, new(AppendEntriesResponse)); err != nil {
+	// Pipeline the append entries through the session, which bounds in-flight
+	// concurrency and rejects new batches once it is closed.
+	if _, err := session.send(req); err != nil {
 		r.logger.Error("failed to pipeline appendEntries", "peer", s.peer, "error", err)
 		return true
 	}
 
-	// Increase the next send log to avoid re-sending old logs
+	// Increase the next send log to avoid re-sending old logs. This is only
+	// the send cursor: the authoritative s.nextIndex moves when the session
+	// reports contiguous successful responses.
 	if n := len(req.Entries); n > 0 {
 		last := req.Entries[n-1]
 		atomic.StoreUint64(nextIdx, last.Index+1)
@@ -530,37 +597,88 @@ func (r *Raft) pipelineSend(s *followerReplication, p AppendPipeline, nextIdx *u
 	return false
 }
 
-// pipelineDecode is used to decode the responses of pipelined requests.
-func (r *Raft) pipelineDecode(s *followerReplication, p AppendPipeline, stopCh, finishCh chan struct{}) {
+// pipelineDecode is used to decode the responses of pipelined requests. All
+// ordering and failure policy lives in pipelineSession; this goroutine only
+// translates session outcomes into raft replication side effects.
+func (r *Raft) pipelineDecode(s *followerReplication, session *pipelineSession, stopCh, finishCh chan struct{}) {
 	defer close(finishCh)
-	respCh := p.Consumer()
+	respCh := session.consumer()
 	for {
 		select {
-		case ready := <-respCh:
+		case ready, ok := <-respCh:
+			if !ok {
+				// The transport closed the consumer channel without a usable
+				// terminal response. Treat it like a transport failure so the
+				// session's pending batches are finalized once and the
+				// replication goroutine falls back instead of stalling in the
+				// drain.
+				session.recordTerminal(pipelineOutcomeRPCError, ErrPipelineShutdown)
+				session.close(ErrPipelineShutdown)
+				return
+			}
 			s.peerLock.RLock()
 			peer := s.peer
 			s.peerLock.RUnlock()
 
-			req, resp := ready.Request(), ready.Response()
+			result := session.handle(ready)
+
+			req := ready.Request()
 			appendStats(string(peer.ID), ready.Start(), float32(len(req.Entries)), r.noLegacyTelemetry)
 
-			// Check for a newer term, stop running
-			if resp.Term > req.Term {
+			switch result.outcome {
+			case pipelineOutcomeStale:
+				// Belongs to an older generation or was already finalized:
+				// its own waiter is complete, but it must not change the
+				// state of the current session.
+				continue
+
+			case pipelineOutcomeGap:
+				// Successful, but an earlier batch is still outstanding. Do
+				// not advance nextIndex or the commitment; only record that
+				// the follower is reachable and still considers us leader.
+				s.setLastContact()
+				s.notifyAll(true)
+
+			case pipelineOutcomeAdvanced:
+				s.setLastContact()
+
+				// The position advanced over a contiguous run of successful
+				// batches; record the new frontier exactly once.
+				atomic.StoreUint64(&s.nextIndex, result.matchIndex+1)
+				s.commitment.match(peer.ID, result.matchIndex)
+
+				// Notify still leader
+				s.notifyAll(true)
+
+			case pipelineOutcomeRejected:
+				// Stop feeding this session and leave nextIndex unchanged.
+				// Standard replication reconciles it from the follower's hint,
+				// which pipelineReplicate applies after joining this decoder.
+				s.setLastContact()
+				r.logger.Warn("pipelined appendEntries rejected, sending older logs",
+					"peer", peer, "next", atomic.LoadUint64(&s.nextIndex))
+
+				// Release a sender that may be blocked in the transport and
+				// stop any further responses from being consumed.
+				session.close(errPipelineBatchRejected)
+				return
+
+			case pipelineOutcomeStaleTerm:
+				// Release a sender that may be blocked in the transport so
+				// the replication loop can observe the step-down.
+				session.close(errPipelineStaleTerm)
 				r.handleStaleTerm(s)
 				return
-			}
 
-			// Update the last contact
-			s.setLastContact()
-
-			// Abort pipeline if not successful
-			if !resp.Success {
+			case pipelineOutcomeRPCError:
+				r.logger.Error("failed to pipeline appendEntries", "peer", peer, "error", result.err)
+				session.close(result.err)
 				return
 			}
 
-			// Update our replication state
-			updateLastAppended(s, req)
 		case <-stopCh:
+			// Session is closing: stop receiving new batches and let
+			// pipelineReplicate drain what is already in flight.
 			return
 		}
 	}

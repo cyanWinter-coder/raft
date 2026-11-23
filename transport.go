@@ -109,6 +109,14 @@ type WithPeers interface {
 // AppendPipeline is used for pipelining AppendEntries requests. It is used
 // to increase the replication throughput by masking latency and better
 // utilizing bandwidth.
+//
+// Implementations should complete every request accepted by AppendEntries
+// exactly once: either its response is delivered on the channel returned by
+// Consumer, or, if the pipeline is closed while the request is in flight, its
+// Error method returns ErrPipelineShutdown. The raft replication layer keeps
+// its own accounting and does not depend on this to make progress, but a
+// transport that abandons in-flight futures forces its consumer to wait for a
+// drain timeout instead of observing the close immediately.
 type AppendPipeline interface {
 	// AppendEntries is used to add another request to the pipeline.
 	// The send may block which is an effective form of back-pressure.
@@ -118,7 +126,9 @@ type AppendPipeline interface {
 	// response futures when they are ready.
 	Consumer() <-chan AppendFuture
 
-	// Close closes the pipeline and cancels all inflight RPCs
+	// Close closes the pipeline and cancels all inflight RPCs. Implementations
+	// should complete each inflight request exactly once, typically with
+	// ErrPipelineShutdown.
 	Close() error
 }
 

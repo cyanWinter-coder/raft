@@ -28,6 +28,15 @@ type inmemPipeline struct {
 	shutdown     bool
 	shutdownCh   chan struct{}
 	shutdownLock sync.RWMutex
+
+	// pending tracks every future the transport accepted but has not completed
+	// yet. Close completes each of them exactly once with ErrPipelineShutdown,
+	// mirroring the network transport's behaviour. pendingClosed is set under
+	// pendingLock when Close takes the set, so a concurrent send either joins
+	// the set (and is completed by Close) or is refused.
+	pendingLock   sync.Mutex
+	pending       map[*appendFuture]struct{}
+	pendingClosed bool
 }
 
 type inmemPipelineInflight struct {
@@ -264,9 +273,52 @@ func newInmemPipeline(trans *InmemTransport, peer *InmemTransport, addr ServerAd
 		doneCh:       make(chan AppendFuture, 16),
 		inprogressCh: make(chan *inmemPipelineInflight, 16),
 		shutdownCh:   make(chan struct{}),
+		pending:      make(map[*appendFuture]struct{}),
 	}
 	go i.decodeResponses()
 	return i
+}
+
+// trackFuture records a future as in flight so Close can complete it if the
+// connection goes away before its response arrives. It reports false when the
+// pipeline is already shutting down, in which case the caller must not send.
+// The pending set and the closed flag share pendingLock with Close, so a
+// future is either flushed by Close or refused here.
+func (i *inmemPipeline) trackFuture(future *appendFuture) bool {
+	i.pendingLock.Lock()
+	defer i.pendingLock.Unlock()
+	if i.pendingClosed {
+		return false
+	}
+	i.pending[future] = struct{}{}
+	return true
+}
+
+// claimFuture removes a future from the pending set, transferring ownership of
+// its completion to the caller. It returns false when the future was already
+// completed by Close (or a previous claim), in which case the caller must not
+// touch its response buffer. Claiming before decoding guarantees that Close's
+// flush and the decoder can never both write the same future.
+func (i *inmemPipeline) claimFuture(future *appendFuture) bool {
+	i.pendingLock.Lock()
+	defer i.pendingLock.Unlock()
+	if _, ok := i.pending[future]; !ok {
+		return false
+	}
+	delete(i.pending, future)
+	return true
+}
+
+// deliverFuture forwards a completed future to the consumer channel, giving up
+// once the pipeline shuts down. The future is already completed, so its waiter
+// does not block.
+func (i *inmemPipeline) deliverFuture(future *appendFuture) bool {
+	select {
+	case i.doneCh <- future:
+		return true
+	case <-i.shutdownCh:
+		return false
+	}
 }
 
 func (i *inmemPipeline) decodeResponses() {
@@ -281,21 +333,26 @@ func (i *inmemPipeline) decodeResponses() {
 
 			select {
 			case rpcResp := <-inp.respCh:
+				// Claim the future before copying into its response buffer. If
+				// Close already completed it, stop touching it.
+				if !i.claimFuture(inp.future) {
+					return
+				}
 				// Copy the result back
-				*inp.future.resp = *rpcResp.Response.(*AppendEntriesResponse)
+				if resp, ok := rpcResp.Response.(*AppendEntriesResponse); ok {
+					*inp.future.resp = *resp
+				}
 				inp.future.respond(rpcResp.Error)
-
-				select {
-				case i.doneCh <- inp.future:
-				case <-i.shutdownCh:
+				if !i.deliverFuture(inp.future) {
 					return
 				}
 
 			case <-timeoutCh:
+				if !i.claimFuture(inp.future) {
+					return
+				}
 				inp.future.respond(fmt.Errorf("command timed out"))
-				select {
-				case i.doneCh <- inp.future:
-				case <-i.shutdownCh:
+				if !i.deliverFuture(inp.future) {
 					return
 				}
 
@@ -340,11 +397,25 @@ func (i *inmemPipeline) AppendEntries(args *AppendEntriesRequest, resp *AppendEn
 		return nil, ErrPipelineShutdown
 	}
 
+	// Track the future before enqueueing so Close cannot miss a request whose
+	// response is still in progress.
+	if !i.trackFuture(future) {
+		return nil, ErrPipelineShutdown
+	}
+
 	select {
 	case i.peer.consumerCh <- rpc:
 	case <-timeout:
+		// Claim then complete only if we still own the future: Close may have
+		// beaten us here and already responded it.
+		if i.claimFuture(future) {
+			future.respond(fmt.Errorf("command enqueue timeout"))
+		}
 		return nil, fmt.Errorf("command enqueue timeout")
 	case <-i.shutdownCh:
+		if i.claimFuture(future) {
+			future.respond(ErrPipelineShutdown)
+		}
 		return nil, ErrPipelineShutdown
 	}
 
@@ -353,6 +424,9 @@ func (i *inmemPipeline) AppendEntries(args *AppendEntriesRequest, resp *AppendEn
 	case i.inprogressCh <- &inmemPipelineInflight{future, respCh}:
 		return future, nil
 	case <-i.shutdownCh:
+		if i.claimFuture(future) {
+			future.respond(ErrPipelineShutdown)
+		}
 		return nil, ErrPipelineShutdown
 	}
 }
@@ -363,12 +437,36 @@ func (i *inmemPipeline) Consumer() <-chan AppendFuture {
 
 func (i *inmemPipeline) Close() error {
 	i.shutdownLock.Lock()
-	defer i.shutdownLock.Unlock()
 	if i.shutdown {
+		i.shutdownLock.Unlock()
 		return nil
 	}
-
 	i.shutdown = true
+	i.shutdownLock.Unlock()
+
+	// Complete every in-flight future exactly once and publish them to the
+	// consumer so a draining session observes the terminal result promptly.
+	// Publishing happens before shutdownCh is closed; delivery is
+	// non-blocking so a consumer that is not reading cannot wedge Close. This
+	// mirrors the network pipeline so both transports present the same close
+	// semantics.
+	i.pendingLock.Lock()
+	pending := i.pending
+	i.pending = make(map[*appendFuture]struct{})
+	i.pendingClosed = true
+	i.pendingLock.Unlock()
+	for future := range pending {
+		future.respond(ErrPipelineShutdown)
+	}
+	for future := range pending {
+		select {
+		case i.doneCh <- future:
+		default:
+		}
+	}
+
+	i.shutdownLock.Lock()
 	close(i.shutdownCh)
+	i.shutdownLock.Unlock()
 	return nil
 }
