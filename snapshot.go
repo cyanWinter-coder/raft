@@ -259,6 +259,76 @@ func (r *Raft) compactLogs(snapIdx uint64) error {
 	return r.compactLogsWithTrailing(snapIdx, lastLogIdx, trailingLogs)
 }
 
+// truncateLogsToSnapshot stitches the log to a freshly restored snapshot. The
+// snapshot meta records the index and term of the last log entry included in
+// the snapshot, so every log entry up to and including that index is redundant
+// and is removed. If the log entry at the snapshot's last included index does
+// not match the snapshot's term, the log carries a divergent history and is
+// removed entirely: the snapshot is the authoritative state up to that point
+// and anything after it can be re-replicated from the leader.
+func (r *Raft) truncateLogsToSnapshot(meta *SnapshotMeta) error {
+	firstIdx, err := r.logs.FirstIndex()
+	if err != nil {
+		return fmt.Errorf("failed to get first log index: %v", err)
+	}
+	lastIdx, err := r.logs.LastIndex()
+	if err != nil {
+		return fmt.Errorf("failed to get last log index: %v", err)
+	}
+
+	// Nothing to truncate.
+	if firstIdx == 0 || lastIdx == 0 {
+		return nil
+	}
+
+	// The log must agree with the snapshot at the snapshot's last included
+	// index. A mismatch means the log has diverged from the snapshot.
+	if meta.Index >= firstIdx && meta.Index <= lastIdx {
+		var entry Log
+		if err := r.logs.GetLog(meta.Index, &entry); err != nil {
+			return fmt.Errorf("failed to get log at snapshot index %d: %v", meta.Index, err)
+		}
+		if entry.Term != meta.Term {
+			r.logger.Warn("log diverges from snapshot, discarding log",
+				"index", meta.Index, "log-term", entry.Term, "snapshot-term", meta.Term)
+			if err := r.logs.DeleteRange(firstIdx, lastIdx); err != nil {
+				return fmt.Errorf("failed to discard divergent logs: %v", err)
+			}
+			return nil
+		}
+	}
+
+	// Drop every entry the snapshot covers.
+	if meta.Index >= firstIdx {
+		maxLog := min(meta.Index, lastIdx)
+		r.logger.Info("truncating logs covered by snapshot", "from", firstIdx, "to", maxLog)
+		if err := r.logs.DeleteRange(firstIdx, maxLog); err != nil {
+			return fmt.Errorf("failed to truncate logs covered by snapshot: %v", err)
+		}
+	}
+	return nil
+}
+
+// refreshLastLog updates the cached last log index and term from the log
+// store. It is used after log truncation, which may have removed the entry
+// the cache currently points at.
+func (r *Raft) refreshLastLog() error {
+	lastIdx, err := r.logs.LastIndex()
+	if err != nil {
+		return fmt.Errorf("failed to get last log index: %v", err)
+	}
+	if lastIdx == 0 {
+		r.setLastLog(0, 0)
+		return nil
+	}
+	var entry Log
+	if err := r.logs.GetLog(lastIdx, &entry); err != nil {
+		return fmt.Errorf("failed to get last log at index %d: %v", lastIdx, err)
+	}
+	r.setLastLog(entry.Index, entry.Term)
+	return nil
+}
+
 // removeOldLogs removes all old logs from the store. This is used for
 // MonotonicLogStores after restore. Callers should verify that the store
 // implementation is monotonic prior to calling.

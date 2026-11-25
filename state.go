@@ -74,6 +74,10 @@ type raftState struct {
 
 	// The current state
 	state RaftState
+
+	// Non-zero while a snapshot restore is in progress. Used to reject new
+	// writes while the restore is mutating the FSM and the log.
+	restoreInProgress int32
 }
 
 func (r *raftState) getState() RaftState {
@@ -130,6 +134,18 @@ func (r *raftState) getCommitIndex() uint64 {
 
 func (r *raftState) setCommitIndex(index uint64) {
 	atomic.StoreUint64(&r.commitIndex, index)
+}
+
+func (r *raftState) setRestoreInProgress(inProgress bool) {
+	if inProgress {
+		atomic.StoreInt32(&r.restoreInProgress, 1)
+	} else {
+		atomic.StoreInt32(&r.restoreInProgress, 0)
+	}
+}
+
+func (r *raftState) isRestoreInProgress() bool {
+	return atomic.LoadInt32(&r.restoreInProgress) != 0
 }
 
 func (r *raftState) getLastApplied() uint64 {

@@ -4,6 +4,10 @@ IMPROVEMENETS
 
 * Added a flag to skip legacy duplicate telemetry. [GH-630](https://github.com/hashicorp/raft/pull/630)
 
+BUG FIXES
+
+* Fix snapshot/log stitching on snapshot restore: the log is now truncated to the snapshot's last included index/term on restore (dropping the log entirely if it diverges from the snapshot), configuration changes committed after the snapshot are no longer lost across restarts when committed-log restore is enabled, restores fail without leaving the node half-initialized, and new writes are rejected with `ErrRestoreInProgress` while a restore is running.
+
 # 1.7.0 (June 5th, 2024)
 
 CHANGES

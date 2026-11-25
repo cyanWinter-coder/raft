@@ -1068,6 +1068,9 @@ func TestRaft_RestoreSnapshotOnStartup_Monotonic(t *testing.T) {
 	if firstIdx != snap.Index-conf.TrailingLogs+1 {
 		t.Fatalf("should trim logs to %d: but is %d", snap.Index-conf.TrailingLogs+1, firstIdx)
 	}
+	if lastIdx != snap.Index {
+		t.Fatalf("expected last log %d to be the snapshot index: but is %d", snap.Index, lastIdx)
+	}
 
 	// Shutdown
 	shutdown := leader.Shutdown()
@@ -1091,11 +1094,18 @@ func TestRaft_RestoreSnapshotOnStartup_Monotonic(t *testing.T) {
 		t.Fatalf("bad last index: %d, expecting %d", last, snap.Index)
 	}
 
-	// Verify that logs have not been reset
+	// Logs covered by the snapshot must have been truncated on restore,
+	// stitching the log to the snapshot. Since nothing was applied after the
+	// snapshot was taken, the log store should be empty now.
 	first, _ := r.logs.FirstIndex()
 	last, _ := r.logs.LastIndex()
-	assert.Equal(t, firstIdx, first)
-	assert.Equal(t, lastIdx, last)
+	assert.Equal(t, uint64(0), first)
+	assert.Equal(t, uint64(0), last)
+
+	// The last entry must now come from the snapshot metadata.
+	lastEntryIdx, lastEntryTerm := r.getLastEntry()
+	assert.Equal(t, snap.Index, lastEntryIdx)
+	assert.Equal(t, snap.Term, lastEntryTerm)
 }
 
 func TestRaft_RestoreSnapshotOnStartup_CommitTrackingLogs(t *testing.T) {
@@ -1150,6 +1160,9 @@ func TestRaft_RestoreSnapshotOnStartup_CommitTrackingLogs(t *testing.T) {
 	if firstIdx != snap.Index-conf.TrailingLogs+1 {
 		t.Fatalf("should trim logs to %d: but is %d", snap.Index-conf.TrailingLogs+1, firstIdx)
 	}
+	if lastIdx != snap.Index {
+		t.Fatalf("expected last log %d to be the snapshot index: but is %d", snap.Index, lastIdx)
+	}
 
 	// Shutdown
 	shutdown := leader.Shutdown()
@@ -1173,11 +1186,18 @@ func TestRaft_RestoreSnapshotOnStartup_CommitTrackingLogs(t *testing.T) {
 		t.Fatalf("bad last index: %d, expecting %d", last, snap.Index)
 	}
 
-	// Verify that logs have not been reset
+	// Logs covered by the snapshot must have been truncated on restore,
+	// stitching the log to the snapshot. Since nothing was applied after the
+	// snapshot was taken, the log store should be empty now.
 	first, _ := r.logs.FirstIndex()
 	last, _ := r.logs.LastIndex()
-	assert.Equal(t, firstIdx, first)
-	assert.Equal(t, lastIdx, last)
+	assert.Equal(t, uint64(0), first)
+	assert.Equal(t, uint64(0), last)
+
+	// The last entry must now come from the snapshot metadata.
+	lastEntryIdx, lastEntryTerm := r.getLastEntry()
+	assert.Equal(t, snap.Index, lastEntryIdx)
+	assert.Equal(t, snap.Term, lastEntryTerm)
 }
 
 func TestRaft_RestoreCommittedLogs(t *testing.T) {
@@ -1292,6 +1312,197 @@ func TestRaft_RestoreCommittedLogs_IncompatibleLogStore(t *testing.T) {
 	}
 	_, err := MakeClusterCustomWithErr(t, opts)
 	require.ErrorIs(t, err, ErrIncompatibleLogStore)
+}
+
+// TestRaft_RestoreSnapshotOnStartup_ConfigChangeAfterSnapshot reproduces the
+// incident where a configuration change committed after a snapshot was taken
+// was lost across a restart: the snapshot restore replayed committed logs
+// into the FSM and the startup configuration scan then skipped them, leaving
+// the node with a stale configuration and no way to elect a leader.
+func TestRaft_RestoreSnapshotOnStartup_ConfigChangeAfterSnapshot(t *testing.T) {
+	// Make the cluster
+	conf := inmemConfig(t)
+	conf.TrailingLogs = 10
+	conf.RestoreCommittedLogs = true
+	opts := &MakeClusterOpts{
+		Peers:              2,
+		Bootstrap:          true,
+		Conf:               conf,
+		CommitTrackingLogs: true,
+	}
+	c := MakeClusterCustom(t, opts)
+	defer c.Close()
+
+	leader := c.Leader()
+
+	// Commit a lot of things
+	var future Future
+	for i := 0; i < 100; i++ {
+		future = leader.Apply([]byte(fmt.Sprintf("test%d", i)), 0)
+	}
+
+	// Wait for the last future to apply
+	if err := future.Error(); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Take a snapshot
+	if err := leader.Snapshot().Error(); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	snaps, _ := leader.snapshots.List()
+	if len(snaps) != 1 {
+		t.Fatalf("should have a snapshot")
+	}
+	snap := snaps[0]
+
+	// Commit a configuration change after the snapshot was taken. The new
+	// server does not exist, but the entry still commits on the two real
+	// nodes since they are a quorum of both the old and the new
+	// configuration.
+	if err := leader.AddVoter("server2", "addr2", 0, 0).Error(); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Commit one more entry so the configuration change is recorded as
+	// committed in the log store.
+	if err := leader.Apply([]byte("final"), 0).Error(); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Shutdown
+	if err := leader.Shutdown().Error(); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Restart the Raft
+	r := leader
+	// Can't just reuse the old transport as it will be closed
+	_, trans2 := NewInmemTransport(r.trans.LocalAddr())
+	cfg := r.config()
+	r, err := NewRaft(&cfg, r.fsm, r.logs, r.stable, r.snapshots, trans2)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	c.rafts[c.IndexOf(leader)] = r
+
+	// The configuration change must not be lost: it has to be reflected in
+	// both the latest and the committed configuration.
+	if got := len(r.configurations.latest.Servers); got != 3 {
+		t.Fatalf("expected 3 servers in latest configuration, got %d", got)
+	}
+	if got := len(r.configurations.committed.Servers); got != 3 {
+		t.Fatalf("expected 3 servers in committed configuration, got %d", got)
+	}
+
+	// The logs covered by the snapshot must be truncated, but the
+	// configuration change and everything after it must be kept.
+	first, err := r.logs.FirstIndex()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	assert.Equal(t, snap.Index+1, first)
+
+	// The committed logs after the snapshot must have been replayed.
+	assert.Equal(t, snap.Index+1, r.getLastApplied())
+}
+
+// TestRaft_TruncateLogsToSnapshot checks the log/snapshot stitching done when
+// a snapshot is restored.
+func TestRaft_TruncateLogsToSnapshot(t *testing.T) {
+	newRaftWithLogs := func(logs ...*Log) (*Raft, *InmemStore) {
+		store := NewInmemStore()
+		for _, l := range logs {
+			if err := store.StoreLog(l); err != nil {
+				t.Fatalf("err: %v", err)
+			}
+		}
+		return &Raft{logs: store, logger: newTestLogger(t)}, store
+	}
+	logRange := func(store *InmemStore) (uint64, uint64) {
+		first, err := store.FirstIndex()
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		last, err := store.LastIndex()
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		return first, last
+	}
+
+	// Logs covered by the snapshot are truncated, newer logs are kept.
+	r, store := newRaftWithLogs(
+		&Log{Index: 1, Term: 1},
+		&Log{Index: 2, Term: 1},
+		&Log{Index: 3, Term: 2},
+		&Log{Index: 4, Term: 2},
+	)
+	if err := r.truncateLogsToSnapshot(&SnapshotMeta{Index: 3, Term: 2}); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if first, last := logRange(store); first != 4 || last != 4 {
+		t.Fatalf("expected only log 4 to remain, got [%d, %d]", first, last)
+	}
+
+	// A term mismatch at the snapshot index means the log diverged from the
+	// snapshot; the whole log is dropped.
+	r, store = newRaftWithLogs(
+		&Log{Index: 1, Term: 1},
+		&Log{Index: 2, Term: 1},
+		&Log{Index: 3, Term: 3},
+		&Log{Index: 4, Term: 3},
+	)
+	if err := r.truncateLogsToSnapshot(&SnapshotMeta{Index: 3, Term: 2}); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if first, last := logRange(store); first != 0 || last != 0 {
+		t.Fatalf("expected empty log, got [%d, %d]", first, last)
+	}
+
+	// A snapshot newer than every log still truncates everything it covers.
+	r, store = newRaftWithLogs(
+		&Log{Index: 1, Term: 1},
+		&Log{Index: 2, Term: 1},
+	)
+	if err := r.truncateLogsToSnapshot(&SnapshotMeta{Index: 5, Term: 2}); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if first, last := logRange(store); first != 0 || last != 0 {
+		t.Fatalf("expected empty log, got [%d, %d]", first, last)
+	}
+
+	// A snapshot older than every log leaves the log alone.
+	r, store = newRaftWithLogs(
+		&Log{Index: 5, Term: 2},
+		&Log{Index: 6, Term: 2},
+	)
+	if err := r.truncateLogsToSnapshot(&SnapshotMeta{Index: 3, Term: 2}); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if first, last := logRange(store); first != 5 || last != 6 {
+		t.Fatalf("expected logs to be untouched, got [%d, %d]", first, last)
+	}
+}
+
+// TestRaft_ApplyRejectedDuringRestore checks that new writes are rejected
+// with a clear error while a snapshot restore is in progress.
+func TestRaft_ApplyRejectedDuringRestore(t *testing.T) {
+	c := MakeCluster(1, t, nil)
+	defer c.Close()
+	leader := c.Leader()
+
+	leader.setRestoreInProgress(true)
+	future := leader.Apply([]byte("test"), 0)
+	if err := future.Error(); err != ErrRestoreInProgress {
+		t.Fatalf("expected ErrRestoreInProgress, got %v", err)
+	}
+	leader.setRestoreInProgress(false)
+
+	// Writes go through again once the restore is done.
+	if err := leader.Apply([]byte("test"), 0).Error(); err != nil {
+		t.Fatalf("err: %v", err)
+	}
 }
 
 func TestRaft_SnapshotRestore_Progress(t *testing.T) {

@@ -51,6 +51,12 @@ var (
 	// entry because it's been superseded by a user snapshot restore.
 	ErrAbortedByRestore = errors.New("snapshot restored while committing log")
 
+	// ErrRestoreInProgress is returned when an operation can't be completed
+	// because a snapshot restore is currently mutating the FSM and the log.
+	// The operation was not applied and may be retried once the restore has
+	// finished.
+	ErrRestoreInProgress = errors.New("snapshot restore in progress")
+
 	// ErrRaftShutdown is returned when operations are requested against an
 	// inactive Raft.
 	ErrRaftShutdown = errors.New("raft is already shutdown")
@@ -607,10 +613,18 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 		return nil, err
 	}
 
-	// Scan through the log for any configuration change entries.
+	// Scan through the log for any configuration change entries. The scan
+	// starts right after the snapshot, even if committed logs were already
+	// replayed into the FSM above: configuration entries in that range must
+	// still be reflected in our own configuration state, otherwise a
+	// configuration change that only exists in the log would be lost across
+	// the restart.
 	snapshotIndex, _ := r.getLastSnapshot()
-	lastappliedIndex := r.getLastApplied()
-	for index := max(snapshotIndex, lastappliedIndex) + 1; index <= lastLog.Index; index++ {
+	lastIndex, err = r.logs.LastIndex()
+	if err != nil {
+		return nil, fmt.Errorf("failed to find last log: %v", err)
+	}
+	for index := snapshotIndex + 1; index <= lastIndex; index++ {
 		var entry Log
 		if err := r.logs.GetLog(index, &entry); err != nil {
 			r.logger.Error("failed to get log", "index", index, "error", err)
@@ -619,6 +633,12 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 		if err := r.processConfigurationLogEntry(&entry); err != nil {
 			return nil, err
 		}
+	}
+
+	// If the commit index restored above already covers the latest
+	// configuration entry, that configuration is committed as well.
+	if r.configurations.latestIndex <= r.getCommitIndex() {
+		r.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)
 	}
 	r.logger.Info("initial configuration",
 		"index", r.configurations.latestIndex,
@@ -655,13 +675,8 @@ func (r *Raft) restoreSnapshot() error {
 			continue
 		}
 
-		// Update the lastApplied so we don't replay old logs
-		r.setLastApplied(snapshot.Index)
-
-		// Update the last stable snapshot info
-		r.setLastSnapshot(snapshot.Index, snapshot.Term)
-
-		// Update the configuration
+		// Work out the configuration to use before mutating any state, so
+		// that a failure here cannot leave the node half-initialized.
 		var conf Configuration
 		var index uint64
 		if snapshot.Version > 0 {
@@ -674,6 +689,33 @@ func (r *Raft) restoreSnapshot() error {
 			}
 			index = snapshot.Index
 		}
+
+		// Stitch the log to the snapshot: the snapshot records the index and
+		// term of the last log entry it includes, so every log entry up to
+		// that point is redundant and must be truncated. If the log disagrees
+		// with the snapshot at that point, the log has diverged and is
+		// dropped entirely; the snapshot is the authoritative state.
+		if err := r.truncateLogsToSnapshot(snapshot); err != nil {
+			r.logger.Error("failed to truncate logs to snapshot", "id", snapshot.ID, "error", err)
+			return err
+		}
+
+		// The truncation above may have removed the entry our cached last log
+		// points at, so refresh the cache from the store before anything
+		// relies on it.
+		if err := r.refreshLastLog(); err != nil {
+			return err
+		}
+
+		// Everything that can fail is done; commit the new state.
+		//
+		// Update the lastApplied so we don't replay old logs
+		r.setLastApplied(snapshot.Index)
+
+		// Update the last stable snapshot info
+		r.setLastSnapshot(snapshot.Index, snapshot.Term)
+
+		// Update the configuration
 		r.setCommittedConfiguration(conf, index)
 		r.setLatestConfiguration(conf, index)
 
@@ -873,6 +915,12 @@ func (r *Raft) Apply(cmd []byte, timeout time.Duration) ApplyFuture {
 // Apply for details on error cases.
 func (r *Raft) ApplyLog(log Log, timeout time.Duration) ApplyFuture {
 	metrics.IncrCounter([]string{"raft", "apply"}, 1)
+
+	// Reject new writes while a snapshot restore is mutating the FSM and
+	// the log; a write accepted now would interleave with the restore.
+	if r.isRestoreInProgress() {
+		return errorFuture{ErrRestoreInProgress}
+	}
 
 	var timer <-chan time.Time
 	if timeout > 0 {

@@ -1121,6 +1121,10 @@ func (r *Raft) restoreUserSnapshot(meta *SnapshotMeta, reader io.Reader) error {
 			latestIndex, committedIndex)
 	}
 
+	// Reject new writes while the restore mutates the FSM and the log.
+	r.setRestoreInProgress(true)
+	defer r.setRestoreInProgress(false)
+
 	// Cancel any inflight requests.
 	for {
 		e := r.leaderState.inflight.Front()
@@ -1932,7 +1936,11 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 	}
 	r.logger.Info("copied to local snapshot", "bytes", n)
 
-	// Restore snapshot
+	// Restore snapshot. Reject new writes while the restore mutates the FSM
+	// and the log.
+	r.setRestoreInProgress(true)
+	defer r.setRestoreInProgress(false)
+
 	future := &restoreFuture{ID: sink.ID()}
 	future.ShutdownCh = r.shutdownCh
 	future.init()
