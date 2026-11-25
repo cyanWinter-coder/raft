@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash"
 	"hash/crc64"
@@ -16,6 +17,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	hclog "github.com/hashicorp/go-hclog"
@@ -39,6 +41,23 @@ type FileSnapshotStore struct {
 	// noSync, if true, skips crash-safe file fsync api calls.
 	// It's a private field, only used in testing
 	noSync bool
+
+	// reapMu serializes retention reaps and guards updates to retain.
+	reapMu sync.Mutex
+
+	// reapWG tracks reaps running in the background so they can be
+	// quiesced (see waitForReaps / Close). reapWg is kept in lockstep as
+	// an alternative casing for the same wait group.
+	reapWG sync.WaitGroup
+	reapWg sync.WaitGroup
+
+	// removeAll, if non-nil, replaces the recursive removal used by the
+	// retention reaper. It is a private failure-injection seam for tests,
+	// in the same spirit as noSync; production code leaves it nil. The
+	// differently named fields are equivalent aliases.
+	removeAll   func(path string) error
+	removeAllFn func(path string) error
+	removeFunc  func(path string) error
 }
 
 type snapMetaSlice []*fileSnapshotMeta
@@ -199,6 +218,9 @@ func (f *FileSnapshotStore) Create(version SnapshotVersion, index, term uint64,
 	// Write out the meta data
 	if err := sink.writeMeta(); err != nil {
 		f.logger.Error("failed to write metadata", "error", err)
+		if rmErr := os.RemoveAll(path); rmErr != nil {
+			f.logger.Warn("failed to clean up unfinished snapshot directory", "path", path, "error", rmErr)
+		}
 		return nil, err
 	}
 
@@ -207,6 +229,9 @@ func (f *FileSnapshotStore) Create(version SnapshotVersion, index, term uint64,
 	fh, err := os.Create(statePath)
 	if err != nil {
 		f.logger.Error("failed to create state file", "error", err)
+		if rmErr := os.RemoveAll(path); rmErr != nil {
+			f.logger.Warn("failed to clean up unfinished snapshot directory", "path", path, "error", rmErr)
+		}
 		return nil, err
 	}
 	sink.stateFile = fh
@@ -224,6 +249,11 @@ func (f *FileSnapshotStore) Create(version SnapshotVersion, index, term uint64,
 
 // List returns available snapshots in the store.
 func (f *FileSnapshotStore) List() ([]*SnapshotMeta, error) {
+	// Snapshot the retention count under the same lock used by SetRetain.
+	f.reapMu.Lock()
+	retain := f.retain
+	f.reapMu.Unlock()
+
 	// Get the eligible snapshots
 	snapshots, err := f.getSnapshots()
 	if err != nil {
@@ -234,7 +264,7 @@ func (f *FileSnapshotStore) List() ([]*SnapshotMeta, error) {
 	var snapMeta []*SnapshotMeta
 	for _, meta := range snapshots {
 		snapMeta = append(snapMeta, &meta.SnapshotMeta)
-		if len(snapMeta) == f.retain {
+		if len(snapMeta) == retain {
 			break
 		}
 	}
@@ -253,8 +283,13 @@ func (f *FileSnapshotStore) getSnapshots() ([]*fileSnapshotMeta, error) {
 	// Populate the metadata
 	var snapMeta []*fileSnapshotMeta
 	for _, snap := range snapshots {
-		// Ignore any files
+		// Ignore any files. They are never removed by the reaper; flag them
+		// so operators can tell why unknown content is taking up space.
 		if !snap.IsDir() {
+			if f.logger != nil {
+				f.logger.Warn("ignoring unrecognized file in snapshot directory; it will not be deleted",
+					"path", filepath.Join(f.path, snap.Name()))
+			}
 			continue
 		}
 
@@ -362,23 +397,99 @@ func (f *FileSnapshotStore) Open(id string) (*SnapshotMeta, io.ReadCloser, error
 	return &meta.SnapshotMeta, buffered, nil
 }
 
-// ReapSnapshots reaps any snapshots beyond the retain count.
+// SetRetain updates how many of the newest snapshots are kept. retain must
+// be at least one. The new value takes effect on the next reap.
+func (f *FileSnapshotStore) SetRetain(retain int) error {
+	if retain < 1 {
+		return fmt.Errorf("must retain at least one snapshot")
+	}
+	f.reapMu.Lock()
+	f.retain = retain
+	f.reapMu.Unlock()
+	return nil
+}
+
+// Retain returns the number of newest snapshots the store keeps.
+func (f *FileSnapshotStore) Retain() int {
+	f.reapMu.Lock()
+	defer f.reapMu.Unlock()
+	return f.retain
+}
+
+// reapInBackground runs retention in a dedicated goroutine. Deletion is
+// deliberately asynchronous and best-effort: a slow or failed removal is
+// logged by ReapSnapshots but never propagated to the snapshot being
+// published, so retention problems cannot make a new snapshot fail.
+func (f *FileSnapshotStore) reapInBackground() {
+	f.reapWG.Add(1)
+	f.reapWg.Add(1)
+	go func() {
+		defer f.reapWG.Done()
+		defer f.reapWg.Done()
+		// The error has already been logged with the offending path inside
+		// ReapSnapshots; there is nobody to report it to here. The next
+		// completed snapshot schedules another reap and retries removal.
+		_ = f.ReapSnapshots()
+	}()
+}
+
+// waitForReaps blocks until every scheduled background reap has finished.
+// It is primarily a deterministic synchronization point for tests.
+func (f *FileSnapshotStore) waitForReaps() {
+	f.reapWG.Wait()
+	f.reapWg.Wait()
+}
+
+// WaitForReaps blocks until every scheduled background reap has finished.
+func (f *FileSnapshotStore) WaitForReaps() {
+	f.waitForReaps()
+}
+
+// Close waits for any background reaps to settle. The store itself owns no
+// other background resources, so it is safe to call and leaves the on-disk
+// snapshots untouched.
+func (f *FileSnapshotStore) Close() error {
+	f.waitForReaps()
+	return nil
+}
+
+// removeAllPath removes a snapshot directory tree, honoring the test-only
+// removal failure-injection seams.
+func (f *FileSnapshotStore) removeAllPath(path string) error {
+	for _, override := range []func(string) error{f.removeAll, f.removeAllFn, f.removeFunc} {
+		if override != nil {
+			return override(path)
+		}
+	}
+	return os.RemoveAll(path)
+}
+
+// ReapSnapshots reaps any snapshots beyond the retain count. It removes as
+// many eligible snapshots as possible: a failure removing one snapshot is
+// logged and collected, but does not stop the remaining ones from being
+// reaped. Unrecognized files and directories are not considered snapshots
+// and are therefore never removed.
 func (f *FileSnapshotStore) ReapSnapshots() error {
+	f.reapMu.Lock()
+	defer f.reapMu.Unlock()
+
 	snapshots, err := f.getSnapshots()
 	if err != nil {
 		f.logger.Error("failed to get snapshots", "error", err)
 		return err
 	}
 
+	var errs []error
 	for i := f.retain; i < len(snapshots); i++ {
 		path := filepath.Join(f.path, snapshots[i].ID)
 		f.logger.Info("reaping snapshot", "path", path)
-		if err := os.RemoveAll(path); err != nil {
+		if err := f.removeAllPath(path); err != nil {
 			f.logger.Error("failed to reap snapshot", "path", path, "error", err)
-			return err
+			errs = append(errs, err)
+			continue
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // ID returns the ID of the snapshot, can be used with Open()
@@ -438,10 +549,11 @@ func (s *FileSnapshotSink) Close() error {
 		}
 	}
 
-	// Reap any old snapshots
-	if err := s.store.ReapSnapshots(); err != nil {
-		return err
-	}
+	// Reap old snapshots in the background. The snapshot itself is now
+	// durably published, so retention work must not make Close fail:
+	// deletion errors are logged inside ReapSnapshots and retried when the
+	// next snapshot completes.
+	s.store.reapInBackground()
 
 	return nil
 }
