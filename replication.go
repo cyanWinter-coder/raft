@@ -43,6 +43,10 @@ type followerReplication struct {
 	// which may fall past the end of the log.
 	nextIndex uint64
 
+	// inflight is the number of log entries sent to this follower whose RPC
+	// lifecycle has not yet completed. It is guarded by windowLock.
+	inflight uint64
+
 	// peer contains the network address and ID of the remote follower.
 	peer Server
 	// peerLock protects 'peer'
@@ -58,6 +62,10 @@ type followerReplication struct {
 	// index; replication should be attempted with a best effort up through that
 	// index, before exiting.
 	stopCh chan uint64
+
+	// abortCh is closed when this replication session is permanently stopping.
+	// It interrupts waits for replication-window capacity.
+	abortCh chan struct{}
 
 	// triggerCh is notified every time new entries are appended to the log.
 	triggerCh chan struct{}
@@ -93,6 +101,14 @@ type followerReplication struct {
 	// allowPipeline is used to determine when to pipeline the AppendEntries RPCs.
 	// It is private to this replication goroutine.
 	allowPipeline bool
+
+	// windowLock guards inflight/windowSize and windowCond.
+	windowLock sync.Mutex
+	// windowCond wakes senders waiting for in-flight window capacity.
+	windowCond *sync.Cond
+	// windowSize is the maximum number of outstanding log entries. Zero means
+	// flow control is disabled for zero-value/test replication state.
+	windowSize uint64
 }
 
 // notifyAll is used to notify all the waiting verify futures
@@ -205,6 +221,8 @@ func (r *Raft) replicateTo(s *followerReplication, lastIndex uint64) (shouldStop
 	var resp AppendEntriesResponse
 	var start time.Time
 	var peer Server
+	var batchTarget uint64
+	var batchLimit int
 
 START:
 	// Prevent an excessive retry rate on errors
@@ -219,11 +237,35 @@ START:
 	peer = s.peer
 	s.peerLock.RUnlock()
 
+	// If the follower is too far behind, ship a snapshot directly instead of
+	// replaying the entire gap one batch at a time.
+	if r.shouldSendSnapshot(s, lastIndex) {
+		goto SEND_SNAP
+	}
+
+	// Do not build a batch larger than the current replication window. Wait
+	// for at least one configured-batch-sized unit (or the whole window when
+	// the cap is smaller than MaxAppendEntries).
+	batchTarget = uint64(r.config().MaxAppendEntries)
+	if windowCap := s.maxWindow(); windowCap > 0 && windowCap < batchTarget {
+		batchTarget = windowCap
+	}
+	if !s.waitForWindowCapacity(batchTarget, s.abortCh) {
+		return true
+	}
+	batchLimit = s.appendEntriesLimit(r.config().MaxAppendEntries)
+
 	// Setup the request
-	if err := r.setupAppendEntries(s, &req, atomic.LoadUint64(&s.nextIndex), lastIndex); err == ErrLogNotFound {
+	if err := r.setupAppendEntriesWithLimit(s, &req, atomic.LoadUint64(&s.nextIndex), lastIndex, batchLimit); err == ErrLogNotFound {
 		goto SEND_SNAP
 	} else if err != nil {
 		return
+	}
+
+	// Reserve the exact entries materialized in req before the RPC. This is
+	// normally immediate because the batch was limited to available capacity.
+	if !s.acquireInflight(len(req.Entries), s.abortCh) {
+		return true
 	}
 
 	// Make the RPC call
@@ -231,8 +273,12 @@ START:
 	if err := r.trans.AppendEntries(peer.ID, peer.Address, &req, &resp); err != nil {
 		r.logger.Error("failed to appendEntries to", "peer", peer, "error", err)
 		s.failures++
+		s.releaseInflight(len(req.Entries))
 		return
 	}
+	// The transport RPC has completed; its window slot is no longer occupied
+	// even if the follower rejected the batch. Progress state is updated below.
+	s.releaseInflight(len(req.Entries))
 	appendStats(string(peer.ID), start, float32(len(req.Entries)), r.noLegacyTelemetry)
 
 	// Check for a newer term, stop running
@@ -292,6 +338,42 @@ SEND_SNAP:
 
 	// Check if there is more to replicate
 	goto CHECK_MORE
+}
+
+// shouldSendSnapshot decides whether a lagging follower should skip the
+// intervening log entries and catch up from the latest snapshot. It only
+// returns true when proactive catch-up is enabled and the snapshot store
+// contains a snapshot covering at least the follower's next index. If no such
+// snapshot exists, normal replication retains the historical behavior.
+func (r *Raft) shouldSendSnapshot(s *followerReplication, lastIndex uint64) bool {
+	threshold := r.config().SnapshotCatchupThreshold
+	if threshold == 0 {
+		return false
+	}
+
+	nextIndex := atomic.LoadUint64(&s.nextIndex)
+	if nextIndex > lastIndex || lastIndex-nextIndex < threshold {
+		return false
+	}
+
+	snapshots, err := r.snapshots.List()
+	if err != nil {
+		r.logger.Error("failed to list snapshots for lagging follower", "error", err)
+		return false
+	}
+	if len(snapshots) == 0 || snapshots[0].Index < nextIndex {
+		return false
+	}
+
+	s.peerLock.RLock()
+	peer := s.peer
+	s.peerLock.RUnlock()
+	r.logger.Info("follower is too far behind, sending snapshot",
+		"peer", peer.ID,
+		"next-index", nextIndex,
+		"last-index", lastIndex,
+		"snapshot-index", snapshots[0].Index)
+	return true
 }
 
 // sendLatestSnapshot is used to send the latest snapshot we have
@@ -366,9 +448,18 @@ func (r *Raft) sendLatestSnapshot(s *followerReplication) (bool, error) {
 
 	// Check for success
 	if resp.Success {
-		// Update the indexes
-		atomic.StoreUint64(&s.nextIndex, meta.Index+1)
-		s.commitment.match(peer.ID, meta.Index)
+		// Snapshot progress is monotonic. A duplicate or late successful
+		// InstallSnapshot response must not move nextIndex backwards.
+		newNextIndex := meta.Index + 1
+		if current := atomic.LoadUint64(&s.nextIndex); newNextIndex > current {
+			atomic.StoreUint64(&s.nextIndex, newNextIndex)
+			s.commitment.match(peer.ID, meta.Index)
+		}
+
+		// Snapshot transfer is not counted by the AppendEntries window, but
+		// any entries left over from an aborted pipeline are covered by the
+		// snapshot and must not retain capacity.
+		s.resetInflight()
 
 		// Clear any failures
 		s.failures = 0
@@ -504,21 +595,50 @@ SEND:
 	case <-finishCh:
 	case <-r.shutdownCh:
 	}
+
+	// The pipeline session is over. Release any entries whose responses were
+	// not consumed; the fallback synchronous replicator starts from the
+	// monotonic s.nextIndex and sends them again.
+	s.resetInflight()
 	return nil
 }
 
 // pipelineSend is used to send data over a pipeline. It is a helper to
-// pipelineReplicate.
-func (r *Raft) pipelineSend(s *followerReplication, p AppendPipeline, nextIdx *uint64, lastIndex uint64) (shouldStop bool) {
+// pipelineReplicate. The optional abort channel can interrupt a wait for
+// window capacity when a pipeline session is being torn down.
+func (r *Raft) pipelineSend(s *followerReplication, p AppendPipeline, nextIdx *uint64, lastIndex uint64, abortCh ...<-chan struct{}) (shouldStop bool) {
+	var abort <-chan struct{} = s.abortCh
+	if len(abortCh) > 0 && abortCh[0] != nil {
+		abort = abortCh[0]
+	}
+
+	// Keep the pipelined batch inside the per-follower window. Wait for some
+	// capacity before materializing logs; decoder responses broadcast when
+	// slots are released.
+	batchTarget := uint64(r.config().MaxAppendEntries)
+	if windowCap := s.maxWindow(); windowCap > 0 && windowCap < batchTarget {
+		batchTarget = windowCap
+	}
+	if !s.waitForWindowCapacity(batchTarget, abort) {
+		return true
+	}
+	batchLimit := s.appendEntriesLimit(r.config().MaxAppendEntries)
+
 	// Create a new append request
 	req := new(AppendEntriesRequest)
-	if err := r.setupAppendEntries(s, req, *nextIdx, lastIndex); err != nil {
+	if err := r.setupAppendEntriesWithLimit(s, req, *nextIdx, lastIndex, batchLimit); err != nil {
+		return true
+	}
+
+	// Reserve the exact entries before handing them to the transport.
+	if !s.acquireInflight(len(req.Entries), abort) {
 		return true
 	}
 
 	// Pipeline the append entries
 	if _, err := p.AppendEntries(req, new(AppendEntriesResponse)); err != nil {
 		r.logger.Error("failed to pipeline appendEntries", "peer", s.peer, "error", err)
+		s.releaseInflight(len(req.Entries))
 		return true
 	}
 
@@ -530,18 +650,40 @@ func (r *Raft) pipelineSend(s *followerReplication, p AppendPipeline, nextIdx *u
 	return false
 }
 
-// pipelineDecode is used to decode the responses of pipelined requests.
-func (r *Raft) pipelineDecode(s *followerReplication, p AppendPipeline, stopCh, finishCh chan struct{}) {
+// pipelineDecode is used to decode the responses of pipelined requests. An
+// optional session abort channel is closed when decoding exits.
+func (r *Raft) pipelineDecode(s *followerReplication, p AppendPipeline, stopCh, finishCh chan struct{}, abortCh ...chan struct{}) {
 	defer close(finishCh)
+	if len(abortCh) > 0 && abortCh[0] != nil {
+		defer close(abortCh[0])
+	}
+	// If the decoder gives up, any batches whose futures were not consumed
+	// are discarded by the session and must release window capacity.
+	defer s.resetInflight()
 	respCh := p.Consumer()
 	for {
 		select {
-		case ready := <-respCh:
+		case ready, ok := <-respCh:
+			if !ok {
+				return
+			}
+
 			s.peerLock.RLock()
 			peer := s.peer
 			s.peerLock.RUnlock()
 
 			req, resp := ready.Request(), ready.Response()
+
+			// This RPC has reached its completion point, so release its own
+			// window reservation exactly once. Progress updates below remain
+			// monotonic and do not manipulate the counter a second time.
+			if req != nil {
+				s.releaseInflight(len(req.Entries))
+			}
+			if req == nil || resp == nil {
+				return
+			}
+
 			appendStats(string(peer.ID), ready.Start(), float32(len(req.Entries)), r.noLegacyTelemetry)
 
 			// Check for a newer term, stop running
@@ -568,6 +710,13 @@ func (r *Raft) pipelineDecode(s *followerReplication, p AppendPipeline, stopCh, 
 
 // setupAppendEntries is used to setup an append entries request.
 func (r *Raft) setupAppendEntries(s *followerReplication, req *AppendEntriesRequest, nextIndex, lastIndex uint64) error {
+	return r.setupAppendEntriesWithLimit(s, req, nextIndex, lastIndex, r.config().MaxAppendEntries)
+}
+
+// setupAppendEntriesWithLimit is setupAppendEntries with an explicit maximum
+// batch size. The replication window uses this to shrink batches to available
+// capacity without changing the wire protocol or LogStore interface.
+func (r *Raft) setupAppendEntriesWithLimit(s *followerReplication, req *AppendEntriesRequest, nextIndex, lastIndex uint64, maxEntries int) error {
 	req.RPCHeader = r.getRPCHeader()
 	req.Term = s.currentTerm
 	// this is needed for retro compatibility, before RPCHeader.Addr was added
@@ -576,7 +725,7 @@ func (r *Raft) setupAppendEntries(s *followerReplication, req *AppendEntriesRequ
 	if err := r.setPreviousLog(req, nextIndex); err != nil {
 		return err
 	}
-	if err := r.setNewLogs(req, nextIndex, lastIndex); err != nil {
+	if err := r.setNewLogsWithLimit(req, nextIndex, lastIndex, maxEntries); err != nil {
 		return err
 	}
 	return nil
@@ -612,10 +761,16 @@ func (r *Raft) setPreviousLog(req *AppendEntriesRequest, nextIndex uint64) error
 
 // setNewLogs is used to setup the logs which should be appended for a request.
 func (r *Raft) setNewLogs(req *AppendEntriesRequest, nextIndex, lastIndex uint64) error {
-	// Append up to MaxAppendEntries or up to the lastIndex. we need to use a
-	// consistent value for maxAppendEntries in the lines below in case it ever
-	// becomes reloadable.
-	maxAppendEntries := r.config().MaxAppendEntries
+	return r.setNewLogsWithLimit(req, nextIndex, lastIndex, r.config().MaxAppendEntries)
+}
+
+// setNewLogsWithLimit is setNewLogs with an explicit batch limit.
+func (r *Raft) setNewLogsWithLimit(req *AppendEntriesRequest, nextIndex, lastIndex uint64, maxAppendEntries int) error {
+	// we need to use a consistent value for maxAppendEntries in the lines below
+	// in case it ever becomes reloadable.
+	if maxAppendEntries <= 0 {
+		maxAppendEntries = r.config().MaxAppendEntries
+	}
 	req.Entries = make([]*Log, 0, maxAppendEntries)
 	maxIndex := min(nextIndex+uint64(maxAppendEntries)-1, lastIndex)
 	for i := nextIndex; i <= maxIndex; i++ {
@@ -650,14 +805,29 @@ func (r *Raft) handleStaleTerm(s *followerReplication) {
 }
 
 // updateLastAppended is used to update follower replication state after a
-// successful AppendEntries RPC.
-// TODO: This isn't used during InstallSnapshot, but the code there is similar.
+// successful AppendEntries RPC. It is safe for duplicate or reordered
+// responses: nextIndex and the commitment match index only move forward.
 func updateLastAppended(s *followerReplication, req *AppendEntriesRequest) {
-	// Mark any inflight logs as committed
+	// Mark any inflight logs as committed.
 	if logs := req.Entries; len(logs) > 0 {
 		last := logs[len(logs)-1]
-		atomic.StoreUint64(&s.nextIndex, last.Index+1)
-		s.commitment.match(s.peer.ID, last.Index)
+		newNextIndex := last.Index + 1
+
+		for {
+			current := atomic.LoadUint64(&s.nextIndex)
+			if newNextIndex <= current {
+				// A duplicate, stale, or reordered acknowledgement already
+				// advanced progress at least this far. It must not move
+				// nextIndex backwards or recalculate commitment state.
+				break
+			}
+			if atomic.CompareAndSwapUint64(&s.nextIndex, current, newNextIndex) {
+				// commitment.match also ignores non-advancing indexes; the
+				// CAS makes the intent explicit and avoids redundant work.
+				s.commitment.match(s.peer.ID, last.Index)
+				break
+			}
+		}
 	}
 
 	// Notify still leader

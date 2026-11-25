@@ -513,6 +513,7 @@ func (r *Raft) runLeader() {
 		// Stop replication
 		for _, p := range r.leaderState.replState {
 			close(p.stopCh)
+			close(p.abortCh)
 		}
 
 		// Respond to all inflight operations
@@ -599,6 +600,7 @@ func (r *Raft) startStopReplication() {
 				peer:                server,
 				commitment:          r.leaderState.commitment,
 				stopCh:              make(chan uint64, 1),
+				abortCh:             make(chan struct{}),
 				triggerCh:           make(chan struct{}, 1),
 				triggerDeferErrorCh: make(chan *deferError, 1),
 				currentTerm:         r.getCurrentTerm(),
@@ -608,6 +610,7 @@ func (r *Raft) startStopReplication() {
 				notifyCh:            make(chan struct{}, 1),
 				stepDown:            r.leaderState.stepDown,
 			}
+			s.initReplicationWindow(r.config().MaxInflightLogs)
 
 			r.leaderState.replState[server.ID] = s
 			r.goFunc(func() { r.replicate(s) })
@@ -637,6 +640,7 @@ func (r *Raft) startStopReplication() {
 		r.logger.Info("removed peer, stopping replication", "peer", serverID, "last-index", lastIdx)
 		repl.stopCh <- lastIdx
 		close(repl.stopCh)
+		close(repl.abortCh)
 		delete(r.leaderState.replState, serverID)
 		r.observe(PeerObservation{Peer: repl.peer, Removed: true})
 	}

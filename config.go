@@ -166,6 +166,22 @@ type Config struct {
 	// an inconsistent log.
 	MaxAppendEntries int
 
+	// MaxInflightLogs caps the number of log entries that may be sent to one
+	// follower without acknowledgement. When the window is full, replication
+	// to that follower pauses until responses release capacity instead of
+	// accumulating an unbounded per-follower buffer on the leader. A zero
+	// value uses DefaultMaxInflightLogs. The cap is counted in log entries and
+	// applies to both synchronous and pipelined replication.
+	MaxInflightLogs uint64
+
+	// SnapshotCatchupThreshold controls proactive snapshot catch-up. When the
+	// follower's next index is at least this many entries behind the leader's
+	// last index and a usable snapshot exists, the leader sends that snapshot
+	// and skips the intervening log entries. DefaultConfig sets
+	// DefaultSnapshotCatchupThreshold; zero disables proactive catch-up and
+	// retains the historical compacted-log fallback.
+	SnapshotCatchupThreshold uint64
+
 	// BatchApplyCh indicates whether we should buffer applyCh
 	// to size MaxAppendEntries. This enables batch log commitment,
 	// but breaks the timeout guarantee on Apply. Specifically,
@@ -295,6 +311,14 @@ type ReloadableConfig struct {
 	// just replay a small set of logs.
 	SnapshotThreshold uint64
 
+	// MaxInflightLogs tunes the per-follower outstanding log cap. Zero resets
+	// the value to DefaultMaxInflightLogs.
+	MaxInflightLogs uint64
+
+	// SnapshotCatchupThreshold tunes proactive snapshot catch-up for followers
+	// that have fallen far behind. Zero disables proactive catch-up.
+	SnapshotCatchupThreshold uint64
+
 	// HeartbeatTimeout specifies the time in follower state without
 	// a leader before we attempt an election.
 	HeartbeatTimeout time.Duration
@@ -311,6 +335,8 @@ func (rc *ReloadableConfig) apply(to Config) Config {
 	to.TrailingLogs = rc.TrailingLogs
 	to.SnapshotInterval = rc.SnapshotInterval
 	to.SnapshotThreshold = rc.SnapshotThreshold
+	to.MaxInflightLogs = rc.MaxInflightLogs
+	to.SnapshotCatchupThreshold = rc.SnapshotCatchupThreshold
 	to.HeartbeatTimeout = rc.HeartbeatTimeout
 	to.ElectionTimeout = rc.ElectionTimeout
 	return to
@@ -321,6 +347,8 @@ func (rc *ReloadableConfig) fromConfig(from Config) {
 	rc.TrailingLogs = from.TrailingLogs
 	rc.SnapshotInterval = from.SnapshotInterval
 	rc.SnapshotThreshold = from.SnapshotThreshold
+	rc.MaxInflightLogs = from.MaxInflightLogs
+	rc.SnapshotCatchupThreshold = from.SnapshotCatchupThreshold
 	rc.HeartbeatTimeout = from.HeartbeatTimeout
 	rc.ElectionTimeout = from.ElectionTimeout
 }
@@ -328,19 +356,33 @@ func (rc *ReloadableConfig) fromConfig(from Config) {
 // DefaultConfig returns a Config with usable defaults.
 func DefaultConfig() *Config {
 	return &Config{
-		ProtocolVersion:    ProtocolVersionMax,
-		HeartbeatTimeout:   1000 * time.Millisecond,
-		ElectionTimeout:    1000 * time.Millisecond,
-		CommitTimeout:      50 * time.Millisecond,
-		MaxAppendEntries:   64,
-		ShutdownOnRemove:   true,
-		TrailingLogs:       10240,
-		SnapshotInterval:   120 * time.Second,
-		SnapshotThreshold:  8192,
-		LeaderLeaseTimeout: 500 * time.Millisecond,
-		LogLevel:           "DEBUG",
+		ProtocolVersion:          ProtocolVersionMax,
+		HeartbeatTimeout:         1000 * time.Millisecond,
+		ElectionTimeout:          1000 * time.Millisecond,
+		CommitTimeout:            50 * time.Millisecond,
+		MaxAppendEntries:         64,
+		MaxInflightLogs:          DefaultMaxInflightLogs,
+		ShutdownOnRemove:         true,
+		TrailingLogs:             10240,
+		SnapshotInterval:         120 * time.Second,
+		SnapshotThreshold:        8192,
+		SnapshotCatchupThreshold: DefaultSnapshotCatchupThreshold,
+		LeaderLeaseTimeout:       500 * time.Millisecond,
+		LogLevel:                 "DEBUG",
 	}
 }
+
+const (
+	// DefaultMaxInflightLogs bounds outstanding logs for one follower. At
+	// 200 writes/sec this is roughly a minute of writes, while keeping the
+	// worst-case per-follower pinned memory fixed instead of growing with an
+	// arbitrarily slow follower.
+	DefaultMaxInflightLogs uint64 = 16384
+
+	// DefaultSnapshotCatchupThreshold is the default lag at which a snapshot
+	// is preferable to sending every missing log entry.
+	DefaultSnapshotCatchupThreshold uint64 = 8192
+)
 
 // ValidateConfig is used to validate a sane configuration
 func ValidateConfig(config *Config) error {
